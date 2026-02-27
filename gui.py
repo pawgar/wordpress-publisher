@@ -47,6 +47,7 @@ class WordPressPublisherApp:
         self.site_combo.bind("<<ComboboxSelected>>", self._on_site_selected)
 
         ttk.Button(row, text="+ Add Site", command=self._add_site_dialog).pack(side="left", padx=2)
+        ttk.Button(row, text="Edit Site", command=self._edit_site_dialog).pack(side="left", padx=2)
         ttk.Button(row, text="- Remove Site", command=self._remove_site).pack(side="left", padx=2)
         ttk.Button(row, text="Test Connection", command=self._test_connection).pack(side="left", padx=2)
 
@@ -219,6 +220,58 @@ class WordPressPublisherApp:
         btn_row.grid(row=4, column=0, columnspan=2, pady=12)
         ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=8)
         ttk.Button(btn_row, text="Add", command=on_add).pack(side="left", padx=8)
+
+    def _edit_site_dialog(self):
+        name = self.site_var.get()
+        if not name:
+            messagebox.showinfo("Info", "Select a site first.")
+            return
+        site = config_manager.get_site_by_name(name)
+        if not site:
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Edit Site: {name}")
+        dlg.geometry("400x220")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        fields = {}
+        defaults = [
+            ("Name:", site["name"], None),
+            ("URL:", site["url"], None),
+            ("Username:", site["username"], None),
+            ("App Password:", site["app_password"], "*"),
+        ]
+        for i, (label, default, show) in enumerate(defaults):
+            ttk.Label(dlg, text=label).grid(row=i, column=0, padx=10, pady=6, sticky="e")
+            var = tk.StringVar(value=default)
+            entry = ttk.Entry(dlg, textvariable=var, width=35, show=show or "")
+            entry.grid(row=i, column=1, padx=10, pady=6)
+            fields[label] = var
+
+        def on_save():
+            new_name = fields["Name:"].get().strip()
+            new_url = fields["URL:"].get().strip()
+            new_user = fields["Username:"].get().strip()
+            new_pwd = fields["App Password:"].get().strip()
+            if not all([new_name, new_url, new_user, new_pwd]):
+                messagebox.showwarning("Missing fields", "All fields are required.", parent=dlg)
+                return
+            if new_name != name and config_manager.get_site_by_name(new_name):
+                messagebox.showwarning("Duplicate", f"Site '{new_name}' already exists.", parent=dlg)
+                return
+            config_manager.remove_site(name)
+            config_manager.add_site(new_name, new_url, new_user, new_pwd)
+            self.site_var.set(new_name)
+            self._refresh_sites_dropdown()
+            self._on_site_selected(None)
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.grid(row=4, column=0, columnspan=2, pady=12)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Save", command=on_save).pack(side="left", padx=8)
 
     def _remove_site(self):
         name = self.site_var.get()
