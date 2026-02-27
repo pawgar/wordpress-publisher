@@ -2,6 +2,8 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
 import time
+import os
+from datetime import datetime
 
 import config_manager
 import wp_api
@@ -281,7 +283,8 @@ class WordPressPublisherApp:
             w.destroy()
 
         # Header
-        for col, (text, width) in enumerate([("#", 3), ("Title", 40), ("Category", 20), ("Author", 20)]):
+        headers = [("#", 3), ("Title", 30), ("Category", 16), ("Author", 16), ("Featured Image", 22), ("Date", 12)]
+        for col, (text, width) in enumerate(headers):
             ttk.Label(self.table_inner, text=text, font=("", 9, "bold"), width=width, anchor="w").grid(
                 row=0, column=col, padx=2, pady=2, sticky="w"
             )
@@ -289,30 +292,56 @@ class WordPressPublisherApp:
         self._rows = []
         cat_names = [c["name"] for c in self.categories]
         user_names = [u["name"] for u in self.users]
+        today = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         for i, art in enumerate(self.articles):
             row_num = i + 1
             ttk.Label(self.table_inner, text=str(row_num), width=3).grid(row=row_num, column=0, padx=2, pady=1, sticky="w")
-            ttk.Label(self.table_inner, text=art["title"], width=40, anchor="w").grid(row=row_num, column=1, padx=2, pady=1, sticky="w")
+            ttk.Label(self.table_inner, text=art["title"], width=30, anchor="w").grid(row=row_num, column=1, padx=2, pady=1, sticky="w")
 
             cat_var = tk.StringVar()
-            cat_combo = ttk.Combobox(self.table_inner, textvariable=cat_var, state="readonly", width=18, values=cat_names)
+            cat_combo = ttk.Combobox(self.table_inner, textvariable=cat_var, state="readonly", width=14, values=cat_names)
             cat_combo.grid(row=row_num, column=2, padx=2, pady=1)
             if cat_names:
                 cat_combo.current(0)
 
             author_var = tk.StringVar()
-            author_combo = ttk.Combobox(self.table_inner, textvariable=author_var, state="readonly", width=18, values=user_names)
+            author_combo = ttk.Combobox(self.table_inner, textvariable=author_var, state="readonly", width=14, values=user_names)
             author_combo.grid(row=row_num, column=3, padx=2, pady=1)
             if user_names:
                 author_combo.current(0)
+
+            # Featured image
+            image_var = tk.StringVar()
+            img_frame = ttk.Frame(self.table_inner)
+            img_frame.grid(row=row_num, column=4, padx=2, pady=1, sticky="w")
+            img_label = ttk.Label(img_frame, textvariable=image_var, width=14, anchor="w")
+            img_label.pack(side="left")
+            img_btn = ttk.Button(img_frame, text="Browse", width=7,
+                                 command=lambda iv=image_var: self._select_image(iv))
+            img_btn.pack(side="left", padx=2)
+
+            # Publish date
+            date_var = tk.StringVar(value=today)
+            date_entry = ttk.Entry(self.table_inner, textvariable=date_var, width=16)
+            date_entry.grid(row=row_num, column=5, padx=2, pady=1)
 
             self._rows.append({
                 "cat_var": cat_var,
                 "cat_combo": cat_combo,
                 "author_var": author_var,
                 "author_combo": author_combo,
+                "image_var": image_var,
+                "date_var": date_var,
             })
+
+    def _select_image(self, image_var):
+        path = filedialog.askopenfilename(
+            title="Select featured image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.gif *.webp")],
+        )
+        if path:
+            image_var.set(path)
 
     # -------------------------------------------------------- Bulk assign
     def _bulk_set_categories(self, _event):
@@ -340,11 +369,13 @@ class WordPressPublisherApp:
             messagebox.showinfo("Info", "Load DOCX files first.")
             return
 
-        # Resolve category & author IDs
+        # Resolve category, author, image path, date
         for i, art in enumerate(self.articles):
             row = self._article_rows[i]
             art["category_id"] = self._resolve_id(self.categories, "name", row["cat_var"].get())
             art["author_id"] = self._resolve_id(self.users, "name", row["author_var"].get())
+            art["image_path"] = row["image_var"].get().strip()
+            art["publish_date"] = row["date_var"].get().strip()
 
         self.btn_publish.config(state="disabled")
         self.progress["maximum"] = len(self.articles)
@@ -356,6 +387,24 @@ class WordPressPublisherApp:
     def _publish_worker(self):
         results = []
         for i, art in enumerate(self.articles):
+            # Upload featured image if provided
+            featured_media_id = None
+            if art.get("image_path") and os.path.isfile(art["image_path"]):
+                self.root.after(0, self.progress_label.config,
+                                {"text": f"Uploading image {i + 1}/{len(self.articles)}..."})
+                img_result = wp_api.upload_media(self.selected_site, art["image_path"])
+                if img_result["success"]:
+                    featured_media_id = img_result["media_id"]
+
+            # Parse date
+            publish_date = None
+            if art.get("publish_date"):
+                try:
+                    dt = datetime.strptime(art["publish_date"], "%Y-%m-%d %H:%M")
+                    publish_date = dt.isoformat()
+                except ValueError:
+                    publish_date = None
+
             result = wp_api.create_post(
                 site=self.selected_site,
                 title=art["title"],
@@ -363,6 +412,8 @@ class WordPressPublisherApp:
                 status=self.status_var.get(),
                 category_id=art["category_id"],
                 author_id=art["author_id"],
+                featured_media_id=featured_media_id,
+                publish_date=publish_date,
             )
             results.append({"title": art["title"], **result})
             self.root.after(0, self._update_progress, i + 1)
