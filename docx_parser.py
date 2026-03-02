@@ -14,8 +14,15 @@ def parse_docx(file_path):
         html = _clean_html(html)
         title, body = _extract_title_and_body(html)
 
+        # Validation warnings
+        filename = os.path.basename(file_path)
         if not title:
-            title = os.path.splitext(os.path.basename(file_path))[0]
+            title = os.path.splitext(filename)[0]
+            warnings.append(f"[{filename}] No H1 found — using filename as title.")
+
+        plain_text = re.sub(r"<[^>]+>", "", body).strip()
+        if not plain_text:
+            warnings.append(f"[{filename}] Document body is empty — no text content found.")
 
         return {
             "success": True,

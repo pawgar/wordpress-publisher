@@ -3,11 +3,72 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import time
 import os
-from datetime import datetime
+import re
+import random
+from datetime import datetime, timedelta
+from PIL import Image, ImageTk
 
 import config_manager
 import wp_api
 import docx_parser
+
+# Try to import drag-and-drop support
+try:
+    from tkinterdnd2 import DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+
+def _title_to_slug(title):
+    """Generate a URL-friendly slug from a title."""
+    slug = title.lower().strip()
+    # Transliterate common Polish characters
+    pl_map = {
+        "ą": "a", "ć": "c", "ę": "e", "ł": "l", "ń": "n",
+        "ó": "o", "ś": "s", "ź": "z", "ż": "z",
+        "Ą": "a", "Ć": "c", "Ę": "e", "Ł": "l", "Ń": "n",
+        "Ó": "o", "Ś": "s", "Ź": "z", "Ż": "z",
+    }
+    for src, dst in pl_map.items():
+        slug = slug.replace(src, dst)
+    # Replace non-alphanumeric with hyphens
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = slug.strip("-")
+    return slug
+
+
+def _generate_random_dates(count, date_from_str, date_to_str):
+    """Generate `count` random datetimes between date_from and date_to.
+
+    Input format: 'YYYY-MM-DD' for dates.
+    Returns sorted list of 'YYYY-MM-DD HH:MM' strings.
+    """
+    try:
+        dt_from = datetime.strptime(date_from_str, "%Y-%m-%d")
+        dt_to = datetime.strptime(date_to_str, "%Y-%m-%d").replace(hour=23, minute=59)
+    except ValueError:
+        return []
+
+    if dt_to <= dt_from:
+        return []
+
+    total_minutes = int((dt_to - dt_from).total_seconds() / 60)
+    dates = []
+    for _ in range(count):
+        rand_minutes = random.randint(0, total_minutes)
+        dt = dt_from + timedelta(minutes=rand_minutes)
+        # Clamp to 6:00 - 23:00 range for realistic publishing hours
+        if dt.hour < 6:
+            dt = dt.replace(hour=random.randint(6, 22), minute=random.randint(0, 59))
+        elif dt.hour > 22:
+            dt = dt.replace(hour=random.randint(6, 22), minute=random.randint(0, 59))
+        dates.append(dt)
+
+    dates.sort()
+    return [d.strftime("%Y-%m-%d %H:%M") for d in dates]
 
 
 class WordPressPublisherApp:
@@ -17,6 +78,8 @@ class WordPressPublisherApp:
         self.categories = []
         self.users = []
         self.selected_site = None
+        self._rows = []
+        self._last_results = []
 
         self._build_ui()
         self._refresh_sites_dropdown()
@@ -68,46 +131,80 @@ class WordPressPublisherApp:
         frame = ttk.LabelFrame(parent, text="3. Article Configuration", padding=8)
         frame.pack(fill="both", expand=True, pady=(0, 6))
 
-        # Draft / Published
-        status_row = ttk.Frame(frame)
-        status_row.pack(fill="x", pady=(0, 6))
-        ttk.Label(status_row, text="Publish as:").pack(side="left")
-        self.status_var = tk.StringVar(value="draft")
-        ttk.Radiobutton(status_row, text="Draft", variable=self.status_var, value="draft").pack(side="left", padx=(8, 4))
-        ttk.Radiobutton(status_row, text="Published", variable=self.status_var, value="publish").pack(side="left")
+        # Row 1: Status + bulk assign
+        top_row = ttk.Frame(frame)
+        top_row.pack(fill="x", pady=(0, 4))
 
-        # Scrollable table
-        table_frame = ttk.Frame(frame)
-        table_frame.pack(fill="both", expand=True)
+        ttk.Label(top_row, text="Publish as:").pack(side="left")
+        self.status_var = tk.StringVar(value="publish")
+        ttk.Radiobutton(top_row, text="Draft", variable=self.status_var, value="draft").pack(side="left", padx=(8, 4))
+        ttk.Radiobutton(top_row, text="Published", variable=self.status_var, value="publish").pack(side="left", padx=(0, 20))
 
-        self.canvas = tk.Canvas(table_frame, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.canvas.yview)
-        self.table_inner = ttk.Frame(self.canvas)
-
-        self.table_inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0, 0), window=self.table_inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=scrollbar.set)
-
-        self.canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        self.canvas.bind_all("<MouseWheel>", lambda e: self.canvas.yview_scroll(-1 * (e.delta // 120), "units"))
-
-        # Bulk assign row
-        bulk_row = ttk.Frame(frame)
-        bulk_row.pack(fill="x", pady=(6, 0))
-
-        ttk.Label(bulk_row, text="Set all categories:").pack(side="left")
+        ttk.Label(top_row, text="Set all categories:").pack(side="left")
         self.bulk_cat_var = tk.StringVar()
-        self.bulk_cat_combo = ttk.Combobox(bulk_row, textvariable=self.bulk_cat_var, state="readonly", width=20)
+        self.bulk_cat_combo = ttk.Combobox(top_row, textvariable=self.bulk_cat_var, state="readonly", width=18)
         self.bulk_cat_combo.pack(side="left", padx=(4, 12))
         self.bulk_cat_combo.bind("<<ComboboxSelected>>", self._bulk_set_categories)
 
-        ttk.Label(bulk_row, text="Set all authors:").pack(side="left")
+        ttk.Label(top_row, text="Set all authors:").pack(side="left")
         self.bulk_author_var = tk.StringVar()
-        self.bulk_author_combo = ttk.Combobox(bulk_row, textvariable=self.bulk_author_var, state="readonly", width=20)
+        self.bulk_author_combo = ttk.Combobox(top_row, textvariable=self.bulk_author_var, state="readonly", width=18)
         self.bulk_author_combo.pack(side="left", padx=4)
         self.bulk_author_combo.bind("<<ComboboxSelected>>", self._bulk_set_authors)
+
+        # Row 2: Random date scheduling
+        sched_row = ttk.Frame(frame)
+        sched_row.pack(fill="x", pady=(0, 6))
+
+        ttk.Label(sched_row, text="Schedule dates from:").pack(side="left")
+        self.sched_from_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ttk.Entry(sched_row, textvariable=self.sched_from_var, width=12).pack(side="left", padx=(4, 8))
+
+        ttk.Label(sched_row, text="to:").pack(side="left")
+        self.sched_to_var = tk.StringVar(value=(datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d"))
+        ttk.Entry(sched_row, textvariable=self.sched_to_var, width=12).pack(side="left", padx=(4, 8))
+
+        ttk.Button(sched_row, text="Randomize Dates", command=self._randomize_dates).pack(side="left", padx=4)
+
+        # Scrollable table using Treeview for resizable columns
+        table_frame = ttk.Frame(frame)
+        table_frame.pack(fill="both", expand=True)
+
+        columns = ("num", "title", "slug", "category", "author", "image", "date")
+        self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=8)
+
+        self.tree.heading("num", text="#")
+        self.tree.heading("title", text="Title (dbl-click edit)")
+        self.tree.heading("slug", text="Slug (dbl-click edit)")
+        self.tree.heading("category", text="Category")
+        self.tree.heading("author", text="Author")
+        self.tree.heading("image", text="Image (dbl-click / drop)")
+        self.tree.heading("date", text="Date")
+
+        self.tree.column("num", width=35, minwidth=30, stretch=False)
+        self.tree.column("title", width=240, minwidth=120)
+        self.tree.column("slug", width=200, minwidth=100)
+        self.tree.column("category", width=120, minwidth=70)
+        self.tree.column("author", width=120, minwidth=70)
+        self.tree.column("image", width=220, minwidth=100)
+        self.tree.column("date", width=130, minwidth=100)
+
+        scrollbar_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        scrollbar_x = ttk.Scrollbar(table_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar_y.grid(row=0, column=1, sticky="ns")
+        scrollbar_x.grid(row=1, column=0, sticky="ew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
+        # Enable drag-and-drop for images
+        if HAS_DND:
+            self.tree.drop_target_register(DND_FILES)
+            self.tree.dnd_bind("<<Drop>>", self._on_tree_drop)
 
     # --- Section 4: Publish ---
     def _build_publish_section(self, parent):
@@ -122,6 +219,10 @@ class WordPressPublisherApp:
 
         self.btn_publish = ttk.Button(row, text="Publish All", command=self._publish_all)
         self.btn_publish.pack(side="left")
+
+        self.btn_clear = ttk.Button(row, text="Clear", command=self._clear_workspace)
+        self.btn_clear.pack(side="left", padx=(8, 0))
+
         self.progress_label = ttk.Label(row, text="")
         self.progress_label.pack(side="left", padx=10)
 
@@ -140,6 +241,8 @@ class WordPressPublisherApp:
         btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill="x")
         ttk.Button(btn_frame, text="Copy URLs", command=self._copy_urls).pack(side="right")
+        self.btn_retry = ttk.Button(btn_frame, text="Retry Failed", command=self._retry_failed)
+        self.btn_retry.pack(side="right", padx=(0, 8))
 
     # ---------------------------------------------------------- Site mgmt
     def _refresh_sites_dropdown(self):
@@ -173,13 +276,13 @@ class WordPressPublisherApp:
         self.bulk_cat_combo["values"] = cat_names
         self.bulk_author_combo["values"] = user_names
 
-        for row in self._article_rows:
-            row["cat_combo"]["values"] = cat_names
-            row["author_combo"]["values"] = user_names
-            if cat_names and not row["cat_var"].get():
-                row["cat_combo"].current(0)
-            if user_names and not row["author_var"].get():
-                row["author_combo"].current(0)
+        for row in self._rows:
+            if cat_names and not row["category"]:
+                row["category"] = cat_names[0]
+            if user_names and not row["author"]:
+                row["author"] = user_names[0]
+
+        self._sync_rows_to_tree()
 
     def _add_site_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -190,10 +293,8 @@ class WordPressPublisherApp:
 
         fields = {}
         for i, (label, show) in enumerate([
-            ("Name:", None),
-            ("URL:", None),
-            ("Username:", None),
-            ("App Password:", "*"),
+            ("Name:", None), ("URL:", None),
+            ("Username:", None), ("App Password:", "*"),
         ]):
             ttk.Label(dlg, text=label).grid(row=i, column=0, padx=10, pady=6, sticky="e")
             var = tk.StringVar()
@@ -238,10 +339,8 @@ class WordPressPublisherApp:
 
         fields = {}
         defaults = [
-            ("Name:", site["name"], None),
-            ("URL:", site["url"], None),
-            ("Username:", site["username"], None),
-            ("App Password:", site["app_password"], "*"),
+            ("Name:", site["name"], None), ("URL:", site["url"], None),
+            ("Username:", site["username"], None), ("App Password:", site["app_password"], "*"),
         ]
         for i, (label, default, show) in enumerate(defaults):
             ttk.Label(dlg, text=label).grid(row=i, column=0, padx=10, pady=6, sticky="e")
@@ -298,10 +397,6 @@ class WordPressPublisherApp:
         threading.Thread(target=worker, daemon=True).start()
 
     # -------------------------------------------------------- File loading
-    @property
-    def _article_rows(self):
-        return getattr(self, "_rows", [])
-
     def _select_files(self):
         paths = filedialog.askopenfilenames(
             title="Select DOCX files",
@@ -312,6 +407,7 @@ class WordPressPublisherApp:
 
         self.articles = []
         errors = []
+        all_warnings = []
         for p in paths:
             result = docx_parser.parse_docx(p)
             if result["success"]:
@@ -322,90 +418,263 @@ class WordPressPublisherApp:
                     "category_id": None,
                     "author_id": None,
                 })
+                if result.get("warnings"):
+                    all_warnings.extend(result["warnings"])
             else:
                 errors.append(result["error"])
 
         self.load_status.config(text=f"{len(self.articles)} files loaded")
+
+        # Show validation warnings
+        if all_warnings:
+            messagebox.showwarning("Validation Warnings", "\n".join(all_warnings))
         if errors:
-            messagebox.showwarning("Parse errors", "\n".join(errors))
+            messagebox.showerror("Parse errors", "\n".join(errors))
 
         self._rebuild_article_table()
 
     def _rebuild_article_table(self):
-        for w in self.table_inner.winfo_children():
-            w.destroy()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
 
-        # Header
-        headers = [("#", 3), ("Title", 30), ("Category", 16), ("Author", 16), ("Featured Image", 22), ("Date", 12)]
-        for col, (text, width) in enumerate(headers):
-            ttk.Label(self.table_inner, text=text, font=("", 9, "bold"), width=width, anchor="w").grid(
-                row=0, column=col, padx=2, pady=2, sticky="w"
-            )
-
-        self._rows = []
         cat_names = [c["name"] for c in self.categories]
         user_names = [u["name"] for u in self.users]
         today = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+        self._rows = []
         for i, art in enumerate(self.articles):
-            row_num = i + 1
-            ttk.Label(self.table_inner, text=str(row_num), width=3).grid(row=row_num, column=0, padx=2, pady=1, sticky="w")
-            ttk.Label(self.table_inner, text=art["title"], width=30, anchor="w").grid(row=row_num, column=1, padx=2, pady=1, sticky="w")
+            row_data = {
+                "index": i,
+                "title": art["title"],
+                "slug": _title_to_slug(art["title"]),
+                "category": cat_names[0] if cat_names else "",
+                "author": user_names[0] if user_names else "",
+                "image": "",
+                "date": today,
+            }
+            self._rows.append(row_data)
 
-            cat_var = tk.StringVar()
-            cat_combo = ttk.Combobox(self.table_inner, textvariable=cat_var, state="readonly", width=14, values=cat_names)
-            cat_combo.grid(row=row_num, column=2, padx=2, pady=1)
-            if cat_names:
-                cat_combo.current(0)
+            self.tree.insert("", "end", iid=str(i), values=(
+                i + 1,
+                row_data["title"],
+                row_data["slug"],
+                row_data["category"],
+                row_data["author"],
+                row_data["image"],
+                row_data["date"],
+            ))
 
-            author_var = tk.StringVar()
-            author_combo = ttk.Combobox(self.table_inner, textvariable=author_var, state="readonly", width=14, values=user_names)
-            author_combo.grid(row=row_num, column=3, padx=2, pady=1)
-            if user_names:
-                author_combo.current(0)
+    def _sync_rows_to_tree(self):
+        for row in self._rows:
+            i = row["index"]
+            iid = str(i)
+            if self.tree.exists(iid):
+                self.tree.item(iid, values=(
+                    i + 1,
+                    row["title"],
+                    row["slug"],
+                    row["category"],
+                    row["author"],
+                    row["image"],
+                    row["date"],
+                ))
 
-            # Featured image
-            image_var = tk.StringVar()
-            img_frame = ttk.Frame(self.table_inner)
-            img_frame.grid(row=row_num, column=4, padx=2, pady=1, sticky="w")
-            img_label = ttk.Label(img_frame, textvariable=image_var, width=14, anchor="w")
-            img_label.pack(side="left")
-            img_btn = ttk.Button(img_frame, text="Browse", width=7,
-                                 command=lambda iv=image_var: self._select_image(iv))
-            img_btn.pack(side="left", padx=2)
+    # -------------------------------------------------- Tree interactions
+    def _on_tree_double_click(self, event):
+        region = self.tree.identify("region", event.x, event.y)
+        if region != "cell":
+            return
 
-            # Publish date
-            date_var = tk.StringVar(value=today)
-            date_entry = ttk.Entry(self.table_inner, textvariable=date_var, width=16)
-            date_entry.grid(row=row_num, column=5, padx=2, pady=1)
+        col = self.tree.identify_column(event.x)
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
 
-            self._rows.append({
-                "cat_var": cat_var,
-                "cat_combo": cat_combo,
-                "author_var": author_var,
-                "author_combo": author_combo,
-                "image_var": image_var,
-                "date_var": date_var,
-            })
+        col_idx = int(col.replace("#", "")) - 1
+        row_idx = int(item)
+        col_names = ["num", "title", "slug", "category", "author", "image", "date"]
+        col_name = col_names[col_idx] if col_idx < len(col_names) else None
 
-    def _select_image(self, image_var):
+        if col_name == "title":
+            self._edit_cell_inline(item, col, row_idx, "title", update_slug=True)
+        elif col_name == "slug":
+            self._edit_cell_inline(item, col, row_idx, "slug")
+        elif col_name == "category":
+            self._combo_cell_inline(item, col, row_idx, "category",
+                                    [c["name"] for c in self.categories])
+        elif col_name == "author":
+            self._combo_cell_inline(item, col, row_idx, "author",
+                                    [u["name"] for u in self.users])
+        elif col_name == "image":
+            self._select_image_for_row(row_idx)
+        elif col_name == "date":
+            self._edit_cell_inline(item, col, row_idx, "date")
+
+    def _edit_cell_inline(self, item, col, row_idx, field, update_slug=False):
+        bbox = self.tree.bbox(item, col)
+        if not bbox:
+            return
+
+        x, y, w, h = bbox
+        current_val = self._rows[row_idx][field]
+
+        entry = ttk.Entry(self.tree, width=w // 8)
+        entry.insert(0, current_val)
+        entry.select_range(0, "end")
+        entry.place(x=x, y=y, width=w, height=h)
+        entry.focus_set()
+
+        def confirm(e=None):
+            new_val = entry.get().strip()
+            if new_val:
+                self._rows[row_idx][field] = new_val
+                if field == "title":
+                    self.articles[row_idx]["title"] = new_val
+                    if update_slug:
+                        self._rows[row_idx]["slug"] = _title_to_slug(new_val)
+                self._sync_rows_to_tree()
+            entry.destroy()
+
+        entry.bind("<Return>", confirm)
+        entry.bind("<FocusOut>", confirm)
+        entry.bind("<Escape>", lambda e: entry.destroy())
+
+    def _combo_cell_inline(self, item, col, row_idx, field, values):
+        bbox = self.tree.bbox(item, col)
+        if not bbox:
+            return
+
+        x, y, w, h = bbox
+        current_val = self._rows[row_idx][field]
+
+        combo = ttk.Combobox(self.tree, values=values, state="readonly", width=w // 8)
+        if current_val in values:
+            combo.set(current_val)
+        combo.place(x=x, y=y, width=w, height=h)
+        combo.focus_set()
+
+        def confirm(e=None):
+            new_val = combo.get()
+            if new_val:
+                self._rows[row_idx][field] = new_val
+                self._sync_rows_to_tree()
+            combo.destroy()
+
+        combo.bind("<<ComboboxSelected>>", confirm)
+        combo.bind("<FocusOut>", confirm)
+        combo.bind("<Escape>", lambda e: combo.destroy())
+
+    def _select_image_for_row(self, row_idx):
         path = filedialog.askopenfilename(
             title="Select featured image",
             filetypes=[("Images", "*.jpg *.jpeg *.png *.gif *.webp")],
         )
         if path:
-            image_var.set(path)
+            self._rows[row_idx]["image"] = path
+            self._sync_rows_to_tree()
+            self._show_image_preview(path)
 
-    # -------------------------------------------------------- Bulk assign
+    def _show_image_preview(self, path):
+        try:
+            img = Image.open(path)
+            img.thumbnail((300, 300))
+            preview = tk.Toplevel(self.root)
+            preview.title("Image Preview")
+            preview.resizable(False, False)
+            photo = ImageTk.PhotoImage(img)
+            label = ttk.Label(preview, image=photo)
+            label.image = photo
+            label.pack(padx=5, pady=5)
+            ttk.Label(preview, text=os.path.basename(path)).pack(pady=(0, 5))
+            ttk.Button(preview, text="Close", command=preview.destroy).pack(pady=(0, 5))
+        except Exception:
+            pass
+
+    # ------------------------------------------------- Drag and drop
+    def _on_tree_drop(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+
+        row_idx = int(item)
+        files = self._parse_dnd_data(event.data)
+
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            if ext in IMAGE_EXTS:
+                self._rows[row_idx]["image"] = f
+                self._sync_rows_to_tree()
+                self._show_image_preview(f)
+                break
+
+    def _parse_dnd_data(self, data):
+        files = []
+        current = ""
+        in_braces = False
+        for char in data:
+            if char == "{":
+                in_braces = True
+            elif char == "}":
+                in_braces = False
+                files.append(current)
+                current = ""
+            elif char == " " and not in_braces:
+                if current:
+                    files.append(current)
+                    current = ""
+            else:
+                current += char
+        if current:
+            files.append(current)
+        return files
+
+    # -------------------------------------------- Bulk assign & scheduling
     def _bulk_set_categories(self, _event):
         val = self.bulk_cat_var.get()
-        for row in self._article_rows:
-            row["cat_var"].set(val)
+        for row in self._rows:
+            row["category"] = val
+        self._sync_rows_to_tree()
 
     def _bulk_set_authors(self, _event):
         val = self.bulk_author_var.get()
-        for row in self._article_rows:
-            row["author_var"].set(val)
+        for row in self._rows:
+            row["author"] = val
+        self._sync_rows_to_tree()
+
+    def _randomize_dates(self):
+        if not self._rows:
+            messagebox.showinfo("Info", "Load DOCX files first.")
+            return
+
+        date_from = self.sched_from_var.get().strip()
+        date_to = self.sched_to_var.get().strip()
+
+        dates = _generate_random_dates(len(self._rows), date_from, date_to)
+        if not dates:
+            messagebox.showerror("Error",
+                                 "Invalid date range. Use YYYY-MM-DD format\n"
+                                 "and make sure 'to' date is after 'from' date.")
+            return
+
+        for i, row in enumerate(self._rows):
+            row["date"] = dates[i]
+        self._sync_rows_to_tree()
+        messagebox.showinfo("Done", f"Assigned {len(dates)} random dates between {date_from} and {date_to}.")
+
+    # ------------------------------------------------------- Clear
+    def _clear_workspace(self):
+        self.articles = []
+        self._rows = []
+        self._last_results = []
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        self.load_status.config(text="No files loaded")
+        self.progress["value"] = 0
+        self.progress_label.config(text="")
+        self.report_text.config(state="normal")
+        self.report_text.delete("1.0", "end")
+        self.report_text.config(state="disabled")
+        self._result_urls = []
 
     # --------------------------------------------------------- Publishing
     def _resolve_id(self, collection, name_key, name_val):
@@ -422,13 +691,14 @@ class WordPressPublisherApp:
             messagebox.showinfo("Info", "Load DOCX files first.")
             return
 
-        # Resolve category, author, image path, date
         for i, art in enumerate(self.articles):
-            row = self._article_rows[i]
-            art["category_id"] = self._resolve_id(self.categories, "name", row["cat_var"].get())
-            art["author_id"] = self._resolve_id(self.users, "name", row["author_var"].get())
-            art["image_path"] = row["image_var"].get().strip()
-            art["publish_date"] = row["date_var"].get().strip()
+            row = self._rows[i]
+            art["title"] = row["title"]
+            art["slug"] = row["slug"]
+            art["category_id"] = self._resolve_id(self.categories, "name", row["category"])
+            art["author_id"] = self._resolve_id(self.users, "name", row["author"])
+            art["image_path"] = row["image"].strip()
+            art["publish_date"] = row["date"].strip()
 
         self.btn_publish.config(state="disabled")
         self.progress["maximum"] = len(self.articles)
@@ -439,8 +709,8 @@ class WordPressPublisherApp:
 
     def _publish_worker(self):
         results = []
+        wp_gmt_offset = wp_api._get_wp_gmt_offset(self.selected_site)
         for i, art in enumerate(self.articles):
-            # Upload featured image if provided
             featured_media_id = None
             if art.get("image_path") and os.path.isfile(art["image_path"]):
                 self.root.after(0, self.progress_label.config,
@@ -449,7 +719,6 @@ class WordPressPublisherApp:
                 if img_result["success"]:
                     featured_media_id = img_result["media_id"]
 
-            # Parse date
             publish_date = None
             if art.get("publish_date"):
                 try:
@@ -467,8 +736,10 @@ class WordPressPublisherApp:
                 author_id=art["author_id"],
                 featured_media_id=featured_media_id,
                 publish_date=publish_date,
+                wp_gmt_offset=wp_gmt_offset,
+                slug=art.get("slug"),
             )
-            results.append({"title": art["title"], **result})
+            results.append({"title": art["title"], "index": i, **result})
             self.root.after(0, self._update_progress, i + 1)
             time.sleep(0.5)
 
@@ -481,6 +752,7 @@ class WordPressPublisherApp:
     def _show_report(self, results):
         self.btn_publish.config(state="normal")
         self.progress_label.config(text="Done!")
+        self._last_results = results
 
         self.report_text.config(state="normal")
         self.report_text.delete("1.0", "end")
@@ -494,6 +766,95 @@ class WordPressPublisherApp:
             else:
                 self.report_text.insert("end", f"[FAIL] {r['title']} -> {r.get('error', 'Unknown error')}\n")
 
+        self.report_text.config(state="disabled")
+
+    # -------------------------------------------------------- Retry failed
+    def _retry_failed(self):
+        if not self._last_results:
+            messagebox.showinfo("Info", "No previous results to retry.")
+            return
+        if not self.selected_site:
+            messagebox.showinfo("Info", "Select a site first.")
+            return
+
+        failed_indices = [r["index"] for r in self._last_results if not r.get("success")]
+        if not failed_indices:
+            messagebox.showinfo("Info", "No failed posts to retry.")
+            return
+
+        self.btn_publish.config(state="disabled")
+        self.btn_retry.config(state="disabled")
+        self.progress["maximum"] = len(failed_indices)
+        self.progress["value"] = 0
+        self.progress_label.config(text="Retrying failed...")
+
+        threading.Thread(target=self._retry_worker, args=(failed_indices,), daemon=True).start()
+
+    def _retry_worker(self, failed_indices):
+        results = []
+        wp_gmt_offset = wp_api._get_wp_gmt_offset(self.selected_site)
+
+        for count, i in enumerate(failed_indices):
+            art = self.articles[i]
+
+            featured_media_id = None
+            if art.get("image_path") and os.path.isfile(art["image_path"]):
+                self.root.after(0, self.progress_label.config,
+                                {"text": f"Uploading image {count + 1}/{len(failed_indices)}..."})
+                img_result = wp_api.upload_media(self.selected_site, art["image_path"])
+                if img_result["success"]:
+                    featured_media_id = img_result["media_id"]
+
+            publish_date = None
+            if art.get("publish_date"):
+                try:
+                    dt = datetime.strptime(art["publish_date"], "%Y-%m-%d %H:%M")
+                    publish_date = dt.isoformat()
+                except ValueError:
+                    publish_date = None
+
+            result = wp_api.create_post(
+                site=self.selected_site,
+                title=art["title"],
+                content=art["html_body"],
+                status=self.status_var.get(),
+                category_id=art["category_id"],
+                author_id=art["author_id"],
+                featured_media_id=featured_media_id,
+                publish_date=publish_date,
+                wp_gmt_offset=wp_gmt_offset,
+                slug=art.get("slug"),
+            )
+            results.append({"title": art["title"], "index": i, **result})
+            self.root.after(0, self._update_retry_progress, count + 1, len(failed_indices))
+            time.sleep(0.5)
+
+        self.root.after(0, self._show_retry_report, results)
+
+    def _update_retry_progress(self, value, total):
+        self.progress["value"] = value
+        self.progress_label.config(text=f"Retrying {value}/{total}...")
+
+    def _show_retry_report(self, results):
+        self.btn_publish.config(state="normal")
+        self.btn_retry.config(state="normal")
+        self.progress_label.config(text="Retry done!")
+
+        result_map = {r["index"]: r for r in results}
+        for j, lr in enumerate(self._last_results):
+            if lr["index"] in result_map:
+                self._last_results[j] = result_map[lr["index"]]
+
+        self.report_text.config(state="normal")
+        self.report_text.delete("1.0", "end")
+        self._result_urls = []
+        for r in self._last_results:
+            if r.get("success"):
+                url = r.get("url", "")
+                self.report_text.insert("end", f"[OK] {r['title']} -> {url}\n")
+                self._result_urls.append(url)
+            else:
+                self.report_text.insert("end", f"[FAIL] {r['title']} -> {r.get('error', 'Unknown error')}\n")
         self.report_text.config(state="disabled")
 
     def _copy_urls(self):

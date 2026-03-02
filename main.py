@@ -1,12 +1,19 @@
-import tkinter as tk
+import sys
+
+try:
+    from tkinterdnd2 import TkinterDnD
+    root = TkinterDnD.Tk()
+except ImportError:
+    import tkinter as tk
+    root = tk.Tk()
+
 from gui import WordPressPublisherApp
 
 
 def main():
-    root = tk.Tk()
     root.title("WordPress Publisher")
-    root.geometry("1100x700")
-    root.minsize(1000, 650)
+    root.geometry("1200x750")
+    root.minsize(1050, 700)
     WordPressPublisherApp(root)
     root.mainloop()
 

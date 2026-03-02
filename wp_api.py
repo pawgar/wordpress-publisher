@@ -2,7 +2,7 @@ import base64
 import os
 import mimetypes
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 TIMEOUT = 30
 
@@ -109,18 +109,54 @@ def upload_media(site, file_path):
         return {"success": False, "error": str(e)}
 
 
+def _get_wp_gmt_offset(site):
+    """Fetch the GMT offset configured in WordPress settings."""
+    try:
+        r = requests.get(f"{site['url']}/wp-json/", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return float(r.json().get("gmt_offset", 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _convert_to_wp_time(local_date_str, wp_gmt_offset):
+    """Convert local date string to WordPress server time.
+
+    Takes a date string from the GUI (user's local time) and adjusts it
+    to match the WordPress timezone so posts publish at the expected time.
+    """
+    local_dt = datetime.fromisoformat(local_date_str)
+    local_offset = datetime.now(timezone.utc).astimezone().utcoffset()
+    local_offset_hours = local_offset.total_seconds() / 3600
+    diff_hours = wp_gmt_offset - local_offset_hours
+    wp_dt = local_dt + timedelta(hours=diff_hours)
+    return wp_dt.isoformat()
+
+
 def create_post(site, title, content, status, category_id, author_id,
-                featured_media_id=None, publish_date=None):
+                featured_media_id=None, publish_date=None, wp_gmt_offset=None,
+                slug=None):
+    if wp_gmt_offset is None:
+        wp_gmt_offset = _get_wp_gmt_offset(site)
+
+    if publish_date:
+        date_value = _convert_to_wp_time(publish_date, wp_gmt_offset)
+    else:
+        date_value = _convert_to_wp_time(datetime.now().isoformat(), wp_gmt_offset)
+
     payload = {
         "title": title,
         "content": content,
         "status": status,
         "categories": [category_id],
         "author": author_id,
-        "date": publish_date or datetime.now().isoformat(),
+        "date": date_value,
     }
     if featured_media_id:
         payload["featured_media"] = featured_media_id
+    if slug:
+        payload["slug"] = slug
 
     try:
         r = requests.post(
