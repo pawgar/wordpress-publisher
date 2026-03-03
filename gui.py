@@ -5,12 +5,15 @@ import time
 import os
 import re
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from PIL import Image, ImageTk
 
 import config_manager
 import wp_api
 import docx_parser
+import gemini_api
+import image_optimizer
 
 # Try to import drag-and-drop support
 try:
@@ -114,6 +117,10 @@ class WordPressPublisherApp:
         ttk.Button(row, text="- Remove Site", command=self._remove_site).pack(side="left", padx=2)
         ttk.Button(row, text="Test Connection", command=self._test_connection).pack(side="left", padx=2)
 
+        # Spacer
+        ttk.Frame(row, width=20).pack(side="left")
+        ttk.Button(row, text="Gemini API Key", command=self._gemini_key_dialog).pack(side="left", padx=2)
+
     # --- Section 2: Load Articles ---
     def _build_load_section(self, parent):
         frame = ttk.LabelFrame(parent, text="2. Load Articles", padding=8)
@@ -200,11 +207,18 @@ class WordPressPublisherApp:
         table_frame.grid_columnconfigure(0, weight=1)
 
         self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
 
         # Enable drag-and-drop for images
         if HAS_DND:
             self.tree.drop_target_register(DND_FILES)
             self.tree.dnd_bind("<<Drop>>", self._on_tree_drop)
+
+        # Bulk image generation row
+        img_row = ttk.Frame(frame)
+        img_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(img_row, text="Generate All Images (Gemini)",
+                   command=self._generate_all_images).pack(side="left")
 
     # --- Section 4: Publish ---
     def _build_publish_section(self, parent):
@@ -277,9 +291,13 @@ class WordPressPublisherApp:
         self.bulk_author_combo["values"] = user_names
 
         for row in self._rows:
-            if cat_names and not row["category"]:
+            if not cat_names:
+                row["category"] = ""
+            elif row["category"] not in cat_names:
                 row["category"] = cat_names[0]
-            if user_names and not row["author"]:
+            if not user_names:
+                row["author"] = ""
+            elif row["author"] not in user_names:
                 row["author"] = user_names[0]
 
         self._sync_rows_to_tree()
@@ -590,6 +608,151 @@ class WordPressPublisherApp:
         except Exception:
             pass
 
+    # ------------------------------------------------- Gemini API Key
+    def _gemini_key_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Gemini API Key")
+        dlg.geometry("450x120")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+
+        ttk.Label(dlg, text="API Key:").grid(row=0, column=0, padx=10, pady=12, sticky="e")
+        key_var = tk.StringVar(value=config_manager.get_gemini_key())
+        ttk.Entry(dlg, textvariable=key_var, width=45, show="*").grid(row=0, column=1, padx=10, pady=12)
+
+        def on_save():
+            config_manager.set_gemini_key(key_var.get().strip())
+            messagebox.showinfo("Saved", "Gemini API key saved.", parent=dlg)
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.grid(row=1, column=0, columnspan=2, pady=8)
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Save", command=on_save).pack(side="left", padx=8)
+
+    # -------------------------------------------- Right-click context menu
+    def _on_tree_right_click(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return
+        col = self.tree.identify_column(event.x)
+        col_idx = int(col.replace("#", "")) - 1
+        col_names = ["num", "title", "slug", "category", "author", "image", "date"]
+        col_name = col_names[col_idx] if col_idx < len(col_names) else None
+
+        if col_name != "image":
+            return
+
+        row_idx = int(item)
+        self.tree.selection_set(item)
+
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Browse image...",
+                         command=lambda: self._select_image_for_row(row_idx))
+        menu.add_command(label="Generate with Gemini",
+                         command=lambda: self._generate_image_for_row(row_idx))
+        if self._rows[row_idx]["image"]:
+            menu.add_command(label="Preview image",
+                             command=lambda: self._show_image_preview(self._rows[row_idx]["image"]))
+            menu.add_separator()
+            menu.add_command(label="Clear image",
+                             command=lambda: self._clear_image_for_row(row_idx))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _clear_image_for_row(self, row_idx):
+        self._rows[row_idx]["image"] = ""
+        self._sync_rows_to_tree()
+
+    # ----------------------------------------- Gemini image generation
+    def _generate_image_for_row(self, row_idx):
+        api_key = config_manager.get_gemini_key()
+        if not api_key:
+            messagebox.showwarning("No API Key",
+                                   "Set your Gemini API key first (button in Sites section).")
+            return
+
+        title = self._rows[row_idx]["title"]
+        self.progress_label.config(text=f"Generating image for: {title[:40]}...")
+        self.btn_publish.config(state="disabled")
+
+        def worker():
+            prompt = gemini_api.build_image_prompt(title)
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_images")
+            result = gemini_api.generate_image(api_key, prompt, output_dir)
+
+            def on_done():
+                self.btn_publish.config(state="normal")
+                if result["success"]:
+                    self._rows[row_idx]["image"] = result["path"]
+                    self._sync_rows_to_tree()
+                    self.progress_label.config(text=f"Image generated for: {title[:40]}")
+                    self._show_image_preview(result["path"])
+                else:
+                    self.progress_label.config(text="")
+                    messagebox.showerror("Gemini Error", result["error"])
+
+            self.root.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _generate_all_images(self):
+        if not self._rows:
+            messagebox.showinfo("Info", "Load DOCX files first.")
+            return
+
+        api_key = config_manager.get_gemini_key()
+        if not api_key:
+            messagebox.showwarning("No API Key",
+                                   "Set your Gemini API key first (button in Sites section).")
+            return
+
+        # Only generate for rows without an image
+        indices = [i for i, r in enumerate(self._rows) if not r["image"].strip()]
+        if not indices:
+            messagebox.showinfo("Info", "All articles already have images assigned.")
+            return
+
+        self.btn_publish.config(state="disabled")
+        self.progress["maximum"] = len(indices)
+        self.progress["value"] = 0
+        self.progress_label.config(text="Generating images...")
+
+        def worker():
+            output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_images")
+            errors = []
+            for count, idx in enumerate(indices):
+                title = self._rows[idx]["title"]
+                self.root.after(0, self.progress_label.config,
+                                {"text": f"Generating {count + 1}/{len(indices)}: {title[:35]}..."})
+
+                prompt = gemini_api.build_image_prompt(title)
+                result = gemini_api.generate_image(api_key, prompt, output_dir)
+
+                if result["success"]:
+                    self._rows[idx]["image"] = result["path"]
+                    self.root.after(0, self._sync_rows_to_tree)
+                else:
+                    errors.append(f"#{idx + 1} {title[:30]}: {result['error']}")
+
+                self.root.after(0, self._update_gen_progress, count + 1, len(indices))
+                time.sleep(1)  # Rate limit courtesy
+
+            self.root.after(0, self._on_generate_all_done, len(indices), errors)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_gen_progress(self, value, total):
+        self.progress["value"] = value
+        self.progress_label.config(text=f"Generating images {value}/{total}...")
+
+    def _on_generate_all_done(self, total, errors=None):
+        self.btn_publish.config(state="normal")
+        generated = sum(1 for r in self._rows if r["image"].strip())
+        self.progress_label.config(text=f"Done! {generated}/{len(self._rows)} articles have images.")
+        if errors:
+            messagebox.showwarning("Image Generation Errors",
+                                   f"{len(errors)} image(s) failed:\n\n" + "\n".join(errors))
+
     # ------------------------------------------------- Drag and drop
     def _on_tree_drop(self, event):
         item = self.tree.identify_row(event.y)
@@ -710,14 +873,72 @@ class WordPressPublisherApp:
     def _publish_worker(self):
         results = []
         wp_gmt_offset = wp_api._get_wp_gmt_offset(self.selected_site)
+        site = self.selected_site
+        status = self.status_var.get()
+        total = len(self.articles)
+
+        # Phase 1: Optimize & upload all images in parallel
+        self.root.after(0, self.progress_label.config, {"text": "Optimizing & uploading images..."})
+        media_map = {}  # index -> {"media_id": ..., "warning": ...}
+
+        articles_with_images = [
+            (i, art) for i, art in enumerate(self.articles)
+            if art.get("image_path") and os.path.isfile(art["image_path"])
+        ]
+
+        if articles_with_images:
+            self.root.after(0, self.progress.configure,
+                            {"maximum": len(articles_with_images)})
+
+            def _upload_one(idx_art):
+                idx, art = idx_art
+                path = art["image_path"]
+                # Optimize: compress to JPEG, strip metadata, random name
+                opt = image_optimizer.optimize_for_upload(path)
+                if not opt["success"]:
+                    return idx, None, f"Optimization failed: {opt['error']}"
+                upload_path = opt["path"]
+                img_result = wp_api.upload_media(site, upload_path)
+                # Clean up optimized temp file
+                try:
+                    if upload_path != path:
+                        os.remove(upload_path)
+                except OSError:
+                    pass
+                if img_result["success"]:
+                    return idx, img_result["media_id"], ""
+                else:
+                    return idx, None, f"Upload failed: {img_result['error']}"
+
+            upload_count = 0
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {pool.submit(_upload_one, item): item[0]
+                           for item in articles_with_images}
+                for future in as_completed(futures):
+                    idx, media_id, warning = future.result()
+                    media_map[idx] = {"media_id": media_id, "warning": warning}
+                    upload_count += 1
+                    self.root.after(0, self._update_upload_progress,
+                                    upload_count, len(articles_with_images))
+
+        # Mark images not found
+        for i, art in enumerate(self.articles):
+            if i not in media_map and art.get("image_path"):
+                if not os.path.isfile(art["image_path"]):
+                    media_map[i] = {"media_id": None,
+                                    "warning": f"Image file not found: {art['image_path']}"}
+
+        # Phase 2: Create posts sequentially
+        self.root.after(0, self.progress.configure, {"maximum": total})
+        self.root.after(0, self.progress.configure, {"value": 0})
+
         for i, art in enumerate(self.articles):
             featured_media_id = None
-            if art.get("image_path") and os.path.isfile(art["image_path"]):
-                self.root.after(0, self.progress_label.config,
-                                {"text": f"Uploading image {i + 1}/{len(self.articles)}..."})
-                img_result = wp_api.upload_media(self.selected_site, art["image_path"])
-                if img_result["success"]:
-                    featured_media_id = img_result["media_id"]
+            image_warning = ""
+
+            if i in media_map:
+                featured_media_id = media_map[i]["media_id"]
+                image_warning = media_map[i]["warning"]
 
             publish_date = None
             if art.get("publish_date"):
@@ -728,10 +949,10 @@ class WordPressPublisherApp:
                     publish_date = None
 
             result = wp_api.create_post(
-                site=self.selected_site,
+                site=site,
                 title=art["title"],
                 content=art["html_body"],
-                status=self.status_var.get(),
+                status=status,
                 category_id=art["category_id"],
                 author_id=art["author_id"],
                 featured_media_id=featured_media_id,
@@ -739,11 +960,15 @@ class WordPressPublisherApp:
                 wp_gmt_offset=wp_gmt_offset,
                 slug=art.get("slug"),
             )
+            result["image_warning"] = image_warning
             results.append({"title": art["title"], "index": i, **result})
             self.root.after(0, self._update_progress, i + 1)
-            time.sleep(0.5)
 
         self.root.after(0, self._show_report, results)
+
+    def _update_upload_progress(self, value, total):
+        self.progress["value"] = value
+        self.progress_label.config(text=f"Uploading images {value}/{total}...")
 
     def _update_progress(self, value):
         self.progress["value"] = value
@@ -761,7 +986,10 @@ class WordPressPublisherApp:
         for r in results:
             if r.get("success"):
                 url = r.get("url", "")
-                self.report_text.insert("end", f"[OK] {r['title']} -> {url}\n")
+                line = f"[OK] {r['title']} -> {url}"
+                if r.get("image_warning"):
+                    line += f"  (IMG: {r['image_warning']})"
+                self.report_text.insert("end", line + "\n")
                 self._result_urls.append(url)
             else:
                 self.report_text.insert("end", f"[FAIL] {r['title']} -> {r.get('error', 'Unknown error')}\n")
@@ -793,17 +1021,55 @@ class WordPressPublisherApp:
     def _retry_worker(self, failed_indices):
         results = []
         wp_gmt_offset = wp_api._get_wp_gmt_offset(self.selected_site)
+        site = self.selected_site
+        status = self.status_var.get()
 
+        # Phase 1: Parallel image optimize & upload
+        articles_with_images = [
+            (i, self.articles[i]) for i in failed_indices
+            if self.articles[i].get("image_path") and os.path.isfile(self.articles[i]["image_path"])
+        ]
+
+        media_map = {}
+
+        if articles_with_images:
+            def _upload_one(idx_art):
+                idx, art = idx_art
+                path = art["image_path"]
+                opt = image_optimizer.optimize_for_upload(path)
+                if not opt["success"]:
+                    return idx, None, f"Optimization failed: {opt['error']}"
+                upload_path = opt["path"]
+                img_result = wp_api.upload_media(site, upload_path)
+                try:
+                    if upload_path != path:
+                        os.remove(upload_path)
+                except OSError:
+                    pass
+                if img_result["success"]:
+                    return idx, img_result["media_id"], ""
+                else:
+                    return idx, None, f"Upload failed: {img_result['error']}"
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = {pool.submit(_upload_one, item): item[0]
+                           for item in articles_with_images}
+                for future in as_completed(futures):
+                    idx, media_id, warning = future.result()
+                    media_map[idx] = {"media_id": media_id, "warning": warning}
+
+        # Phase 2: Create posts
         for count, i in enumerate(failed_indices):
             art = self.articles[i]
 
             featured_media_id = None
-            if art.get("image_path") and os.path.isfile(art["image_path"]):
-                self.root.after(0, self.progress_label.config,
-                                {"text": f"Uploading image {count + 1}/{len(failed_indices)}..."})
-                img_result = wp_api.upload_media(self.selected_site, art["image_path"])
-                if img_result["success"]:
-                    featured_media_id = img_result["media_id"]
+            image_warning = ""
+
+            if i in media_map:
+                featured_media_id = media_map[i]["media_id"]
+                image_warning = media_map[i]["warning"]
+            elif art.get("image_path") and not os.path.isfile(art["image_path"]):
+                image_warning = f"Image file not found: {art['image_path']}"
 
             publish_date = None
             if art.get("publish_date"):
@@ -814,10 +1080,10 @@ class WordPressPublisherApp:
                     publish_date = None
 
             result = wp_api.create_post(
-                site=self.selected_site,
+                site=site,
                 title=art["title"],
                 content=art["html_body"],
-                status=self.status_var.get(),
+                status=status,
                 category_id=art["category_id"],
                 author_id=art["author_id"],
                 featured_media_id=featured_media_id,
@@ -825,9 +1091,9 @@ class WordPressPublisherApp:
                 wp_gmt_offset=wp_gmt_offset,
                 slug=art.get("slug"),
             )
+            result["image_warning"] = image_warning
             results.append({"title": art["title"], "index": i, **result})
             self.root.after(0, self._update_retry_progress, count + 1, len(failed_indices))
-            time.sleep(0.5)
 
         self.root.after(0, self._show_retry_report, results)
 
@@ -851,7 +1117,10 @@ class WordPressPublisherApp:
         for r in self._last_results:
             if r.get("success"):
                 url = r.get("url", "")
-                self.report_text.insert("end", f"[OK] {r['title']} -> {url}\n")
+                line = f"[OK] {r['title']} -> {url}"
+                if r.get("image_warning"):
+                    line += f"  (IMG: {r['image_warning']})"
+                self.report_text.insert("end", line + "\n")
                 self._result_urls.append(url)
             else:
                 self.report_text.insert("end", f"[FAIL] {r['title']} -> {r.get('error', 'Unknown error')}\n")

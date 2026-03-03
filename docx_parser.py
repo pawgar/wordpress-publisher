@@ -12,6 +12,7 @@ def parse_docx(file_path):
         warnings = [str(m) for m in result.messages]
 
         html = _clean_html(html)
+        html = _strip_bold_from_headings(html)
         title, body = _extract_title_and_body(html)
 
         # Validation warnings
@@ -55,6 +56,36 @@ def _clean_html(html):
     html = re.sub(r"\n\s*\n", "\n", html)
 
     return html.strip()
+
+
+def _strip_bold_from_headings(html):
+    """Remove all bold/strong formatting from inside heading tags (h1-h6).
+
+    Handles: <strong>, <b>, <span style="font-weight:bold">,
+    <span style="font-weight:700">, and nested combinations.
+    """
+    def _remove_bold_tags(match):
+        tag = match.group(1)       # e.g. "h2"
+        attrs = match.group(2)     # any attributes on the heading tag
+        content = match.group(3)   # inner HTML
+        # Remove <strong>...</strong>
+        content = re.sub(r"<strong>(.*?)</strong>", r"\1", content, flags=re.DOTALL)
+        # Remove <b>...</b>
+        content = re.sub(r"<b>(.*?)</b>", r"\1", content, flags=re.DOTALL)
+        # Remove <span style="...font-weight:bold...">...</span>
+        content = re.sub(
+            r'<span[^>]*style="[^"]*font-weight\s*:\s*(bold|[7-9]\d\d)[^"]*"[^>]*>(.*?)</span>',
+            r"\2", content, flags=re.DOTALL,
+        )
+        return f"<{tag}{attrs}>{content}</{tag}>"
+
+    html = re.sub(
+        r"<(h[1-6])(\s[^>]*)?>(.+?)</\1>",
+        _remove_bold_tags,
+        html,
+        flags=re.DOTALL,
+    )
+    return html
 
 
 def _extract_title_and_body(html):

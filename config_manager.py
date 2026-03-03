@@ -48,3 +48,13 @@ def remove_site(name):
     config = load_config()
     config["sites"] = [s for s in config["sites"] if s["name"] != name]
     save_config(config)
+
+
+def get_gemini_key():
+    return load_config().get("gemini_api_key", "")
+
+
+def set_gemini_key(key):
+    config = load_config()
+    config["gemini_api_key"] = key
+    save_config(config)
