@@ -66,7 +66,7 @@ def _strip_bold_from_headings(html):
     """
     def _remove_bold_tags(match):
         tag = match.group(1)       # e.g. "h2"
-        attrs = match.group(2)     # any attributes on the heading tag
+        attrs = match.group(2) or ""  # any attributes on the heading tag
         content = match.group(3)   # inner HTML
         # Remove <strong>...</strong>
         content = re.sub(r"<strong>(.*?)</strong>", r"\1", content, flags=re.DOTALL)
